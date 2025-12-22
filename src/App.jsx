@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import './App.css';
 import JSZip from 'jszip';
-import { 
+import {
   generateVoronoiPoints, 
   generateVoronoiPointsFromAlpha,
   createVoronoi, 
@@ -9,6 +9,7 @@ import {
   drawPieces,
   getImagePixelData,
   canvasToBlob,
+  trimImageToOpaqueBounds,
 } from './voronoiSlicer';
 
 function App() {
@@ -17,6 +18,7 @@ function App() {
   const [pieces, setPieces] = useState([]);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState('image');
+  const [exportName, setExportName] = useState('sliced-pieces');
   const canvasRef = useRef(null);
   const fileInputRef = useRef(null);
   const imageDataRef = useRef(null);
@@ -26,14 +28,26 @@ function App() {
 
     const baseName = file.name ? file.name.replace(/\.[^.]+$/, '') : 'image';
     setUploadedFileName(baseName);
+    setExportName(baseName || 'sliced-pieces');
 
     const reader = new FileReader();
     reader.onload = (e) => {
       const img = new Image();
       img.onload = () => {
-        setImage(img);
-        setPieces([]);
-        imageDataRef.current = getImagePixelData(img);
+        const trimmed = trimImageToOpaqueBounds(img, 8);
+        const handleFinalImage = (finalImage) => {
+          setImage(finalImage);
+          setPieces([]);
+          imageDataRef.current = getImagePixelData(finalImage);
+        };
+
+        if (trimmed.needsTrim) {
+          const trimmedImg = new Image();
+          trimmedImg.onload = () => handleFinalImage(trimmedImg);
+          trimmedImg.src = trimmed.dataUrl;
+        } else {
+          handleFinalImage(img);
+        }
       };
       img.src = e.target.result;
     };
@@ -86,7 +100,7 @@ function App() {
     // Slice image into pieces
     const slicedPieces = sliceImageIntoVoronoiPieces(image, voronoi, numPieces, {
       alphaThreshold: 8,
-      minOpaqueRatio: 0.01,
+      minOpaqueRatio: 0,
       includeOutline: true,
     });
     setPieces(slicedPieces);
@@ -107,13 +121,12 @@ function App() {
   const downloadPiecesZip = async () => {
     if (!pieces.length) return;
 
+    const baseExportName = (exportName?.trim() || uploadedFileName || 'sliced-pieces').replace(/\s+/g, '-');
     const zip = new JSZip();
-    const folder = zip.folder(`${uploadedFileName}-voronoi-pieces`);
+    const folder = zip.folder(baseExportName);
     if (!folder) return;
 
     const manifest = {
-      version: 1,
-      generatedAt: new Date().toISOString(),
       source: {
         fileBaseName: uploadedFileName,
         width: image?.width ?? null,
@@ -183,11 +196,11 @@ function App() {
       pieces: [],
     };
 
-    const exportJobs = pieces.map(async (piece, idx) => {
+      const exportJobs = pieces.map(async (piece, idx) => {
       const blob = await canvasToBlob(piece.canvas, 'image/png');
       const padded = String(idx + 1).padStart(3, '0');
 
-      const fileName = `${padded}-piece-${piece.id}.png`;
+        const fileName = `${baseExportName}-${padded}-piece-${piece.id}.png`;
       folder.file(fileName, blob);
 
       const width = piece.canvas?.width ?? piece.width;
@@ -229,18 +242,17 @@ function App() {
 
     // Keep manifest ordering stable for editor tools
     manifest.pieces.sort((a, b) => a.id - b.id);
-    folder.file('manifest.json', JSON.stringify(manifest, null, 2));
+    folder.file(`${baseExportName}-slice-positioner.json`, JSON.stringify(manifest, null, 2));
 
     const zipBlob = await zip.generateAsync({ type: 'blob' });
 
     const url = URL.createObjectURL(zipBlob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${uploadedFileName}-voronoi-pieces.zip`;
+    a.download = `${baseExportName}.zip`;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    URL.revokeObjectURL(url);
   };
 
   return (
@@ -283,15 +295,15 @@ function App() {
                 <label htmlFor="numPieces">
                   Number of Pieces: <strong>{numPieces}</strong>
                 </label>
-                <input
-                  id="numPieces"
-                  type="range"
-                  min="5"
-                  max="100"
-                  value={numPieces}
-                  onChange={(e) => setNumPieces(parseInt(e.target.value))}
-                  className="slider"
-                />
+                  <input
+                    id="numPieces"
+                    type="range"
+                    min="5"
+                    max="300"
+                    value={numPieces}
+                    onChange={(e) => setNumPieces(parseInt(e.target.value))}
+                    className="slider"
+                  />
                 <div className="range-labels">
                   <span>Fewer (Bigger)</span>
                   <span>More (Smaller)</span>
@@ -308,11 +320,24 @@ function App() {
               </div>
 
               {pieces.length > 0 && (
-                <div className="control-group actions-row">
-                  <button className="btn btn-primary" onClick={downloadPiecesZip}>
-                    ⬇️ Export
-                  </button>
-                </div>
+                <>
+                  <div className="control-group">
+                    <label htmlFor="exportName">Export Name</label>
+                    <input
+                      id="exportName"
+                      className="text-input"
+                      type="text"
+                      value={exportName}
+                      onChange={(e) => setExportName(e.target.value)}
+                      placeholder="enter filename"
+                    />
+                  </div>
+                  <div className="control-group actions-row">
+                    <button className="btn btn-primary" onClick={downloadPiecesZip}>
+                      ⬇️ Export
+                    </button>
+                  </div>
+                </>
               )}
             </>
           )}

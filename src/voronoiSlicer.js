@@ -11,6 +11,59 @@ export function getImagePixelData(image) {
   return imageData;
 }
 
+export function trimImageToOpaqueBounds(image, alphaThreshold = 8) {
+  const canvas = document.createElement('canvas');
+  canvas.width = image.width;
+  canvas.height = image.height;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(image, 0, 0);
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+  let minX = canvas.width;
+  let minY = canvas.height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < canvas.height; y++) {
+    for (let x = 0; x < canvas.width; x++) {
+      const idx = (y * canvas.width + x) * 4 + 3;
+      if (imageData.data[idx] >= alphaThreshold) {
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+      }
+    }
+  }
+
+  if (maxX < 0 || maxY < 0) {
+    return { needsTrim: false };
+  }
+
+  const width = maxX - minX + 1;
+  const height = maxY - minY + 1;
+  const trimmedCanvas = document.createElement('canvas');
+  trimmedCanvas.width = width;
+  trimmedCanvas.height = height;
+  trimmedCanvas.getContext('2d').drawImage(
+    image,
+    minX,
+    minY,
+    width,
+    height,
+    0,
+    0,
+    width,
+    height
+  );
+
+  return {
+    needsTrim: true,
+    dataUrl: trimmedCanvas.toDataURL(),
+    offset: { x: minX, y: minY },
+  };
+}
+
 function isOpaqueAt(imageData, x, y, alphaThreshold) {
   const ix = Math.max(0, Math.min(imageData.width - 1, Math.floor(x)));
   const iy = Math.max(0, Math.min(imageData.height - 1, Math.floor(y)));
@@ -25,6 +78,17 @@ function pickRandomOpaquePoint(imageData, width, height, alphaThreshold, maxTrie
     if (isOpaqueAt(imageData, x, y, alphaThreshold)) return [x, y];
   }
   return [Math.random() * width, Math.random() * height];
+}
+
+function polygonArea(cell) {
+  if (!cell || cell.length < 3) return 0;
+  let area = 0;
+  for (let i = 0; i < cell.length; i++) {
+    const [x1, y1] = cell[i];
+    const [x2, y2] = cell[(i + 1) % cell.length];
+    area += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(area) / 2;
 }
 
 /**
@@ -131,18 +195,9 @@ export function sliceImageIntoVoronoiPieces(image, voronoi, numCells, options = 
       0, 0, width, height          // Destination rectangle
     );
 
-    // If the source has transparency, skip pieces that are mostly transparent.
-    // This helps "ignore" transparent background areas (e.g., PNG with alpha).
-    const pieceData = ctx.getImageData(0, 0, width, height);
-    let opaqueCount = 0;
-    for (let p = 3; p < pieceData.data.length; p += 4) {
-      if (pieceData.data[p] >= alphaThreshold) opaqueCount++;
-    }
-    const totalPixels = canvas.width * canvas.height;
-    const opaqueRatio = totalPixels > 0 ? opaqueCount / totalPixels : 0;
-    if (opaqueRatio < minOpaqueRatio) {
-      continue;
-    }
+    // NOTE:
+    // We intentionally do not discard pieces based on transparency.
+    // This guarantees that no visible parts of the sprite are lost due to filtering.
     
     pieces.push({
       id: i,
