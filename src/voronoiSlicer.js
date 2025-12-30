@@ -64,6 +64,130 @@ export function trimImageToOpaqueBounds(image, alphaThreshold = 8) {
   };
 }
 
+function trimCanvasToOpaqueBounds(sourceCanvas, alphaThreshold = 8) {
+  const width = sourceCanvas.width;
+  const height = sourceCanvas.height;
+  const ctx = sourceCanvas.getContext('2d', { willReadFrequently: true });
+  const imageData = ctx.getImageData(0, 0, width, height);
+
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4 + 3;
+      if (imageData.data[idx] >= alphaThreshold) {
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (maxX < 0 || maxY < 0) {
+    return { needsTrim: false };
+  }
+
+  const trimmedW = maxX - minX + 1;
+  const trimmedH = maxY - minY + 1;
+
+  const trimmedCanvas = document.createElement('canvas');
+  trimmedCanvas.width = trimmedW;
+  trimmedCanvas.height = trimmedH;
+  trimmedCanvas
+    .getContext('2d')
+    .drawImage(sourceCanvas, minX, minY, trimmedW, trimmedH, 0, 0, trimmedW, trimmedH);
+
+  return {
+    needsTrim: true,
+    canvas: trimmedCanvas,
+    offset: { x: minX, y: minY },
+  };
+}
+
+function findOpaquePivotInCanvas(sourceCanvas, alphaThreshold = 8) {
+  const width = sourceCanvas.width;
+  const height = sourceCanvas.height;
+  const ctx = sourceCanvas.getContext('2d', { willReadFrequently: true });
+  const imageData = ctx.getImageData(0, 0, width, height);
+
+  let sumX = 0;
+  let sumY = 0;
+  let count = 0;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4 + 3;
+      if (imageData.data[idx] >= alphaThreshold) {
+        sumX += x + 0.5;
+        sumY += y + 0.5;
+        count++;
+      }
+    }
+  }
+
+  if (count === 0) {
+    return { hasOpaque: false, x: width / 2, y: height / 2 };
+  }
+
+  const cx = sumX / count;
+  const cy = sumY / count;
+
+  // Pick an *actual* opaque pixel closest to the centroid.
+  let bestX = Math.floor(cx);
+  let bestY = Math.floor(cy);
+  let bestDist2 = Infinity;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4 + 3;
+      if (imageData.data[idx] < alphaThreshold) continue;
+      const dx = (x + 0.5) - cx;
+      const dy = (y + 0.5) - cy;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestDist2) {
+        bestDist2 = d2;
+        bestX = x;
+        bestY = y;
+      }
+    }
+  }
+
+  return { hasOpaque: true, x: bestX + 0.5, y: bestY + 0.5 };
+}
+
+function recenterCanvasSoPointIsCenter(sourceCanvas, pointX, pointY) {
+  const width = sourceCanvas.width;
+  const height = sourceCanvas.height;
+
+  const halfW = Math.max(1, Math.ceil(Math.max(pointX, width - pointX)));
+  const halfH = Math.max(1, Math.ceil(Math.max(pointY, height - pointY)));
+  const outW = Math.max(1, halfW * 2);
+  const outH = Math.max(1, halfH * 2);
+
+  const offsetX = halfW - pointX;
+  const offsetY = halfH - pointY;
+
+  // If it is already centered enough, avoid allocating a new canvas.
+  const alreadyCentered =
+    outW === width &&
+    outH === height &&
+    Math.abs(offsetX) < 1e-6 &&
+    Math.abs(offsetY) < 1e-6;
+  if (alreadyCentered) {
+    return { canvas: sourceCanvas, offset: { x: 0, y: 0 } };
+  }
+
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = outW;
+  outCanvas.height = outH;
+  outCanvas.getContext('2d').drawImage(sourceCanvas, offsetX, offsetY);
+  return { canvas: outCanvas, offset: { x: offsetX, y: offsetY } };
+}
+
 function isOpaqueAt(imageData, x, y, alphaThreshold) {
   const ix = Math.max(0, Math.min(imageData.width - 1, Math.floor(x)));
   const iy = Math.max(0, Math.min(imageData.height - 1, Math.floor(y)));
@@ -145,6 +269,7 @@ export function sliceImageIntoVoronoiPieces(image, voronoi, numCells, options = 
     alphaThreshold = 8,
     minOpaqueRatio = 0.01,
     includeOutline = true,
+    recenterPivotToOpaque = true,
   } = options;
 
   const pieces = [];
@@ -195,17 +320,44 @@ export function sliceImageIntoVoronoiPieces(image, voronoi, numCells, options = 
       0, 0, width, height          // Destination rectangle
     );
 
+    // Fix for "edge" pieces with lots of transparent/negative space:
+    // 1) trim transparent borders
+    // 2) shift/pad so the *sprite center* lands on an opaque pixel
+    // This keeps center-pivot workflows usable in engines like Unity.
+    let finalCanvas = canvas;
+    let finalX = minX;
+    let finalY = minY;
+
+    const trimmed = trimCanvasToOpaqueBounds(finalCanvas, alphaThreshold);
+    if (trimmed.needsTrim) {
+      finalCanvas = trimmed.canvas;
+      finalX += trimmed.offset.x;
+      finalY += trimmed.offset.y;
+    }
+
+    if (recenterPivotToOpaque) {
+      const pivot = findOpaquePivotInCanvas(finalCanvas, alphaThreshold);
+      if (pivot.hasOpaque) {
+        const recentered = recenterCanvasSoPointIsCenter(finalCanvas, pivot.x, pivot.y);
+        finalCanvas = recentered.canvas;
+        // If we draw the old canvas at (offsetX, offsetY), the new (0,0)
+        // corresponds to source shifted by (-offsetX, -offsetY).
+        finalX -= recentered.offset.x;
+        finalY -= recentered.offset.y;
+      }
+    }
+
     // NOTE:
     // We intentionally do not discard pieces based on transparency.
     // This guarantees that no visible parts of the sprite are lost due to filtering.
     
     pieces.push({
       id: i,
-      canvas: canvas,
-      originalX: minX,
-      originalY: minY,
-      width: width,
-      height: height,
+      canvas: finalCanvas,
+      originalX: finalX,
+      originalY: finalY,
+      width: finalCanvas.width,
+      height: finalCanvas.height,
       cell: cell
     });
   }
