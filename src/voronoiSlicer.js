@@ -394,6 +394,223 @@ export function drawPieces(ctx, pieces, options = {}) {
   });
 }
 
+function polygonBounds(cell) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  cell.forEach(([x, y]) => {
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+  });
+  return { minX, minY, maxX, maxY };
+}
+
+function hasOpaquePixels(canvas, threshold = 8) {
+  const { data } = canvas
+    .getContext('2d', { willReadFrequently: true })
+    .getImageData(0, 0, canvas.width, canvas.height);
+  for (let index = 3; index < data.length; index += 4) {
+    if (data[index] >= threshold) return true;
+  }
+  return false;
+}
+
+function slicePolygonCells(image, cells, options = {}) {
+  const { alphaThreshold = 8, recenterPivotToOpaque = true } = options;
+  const pieces = [];
+
+  cells.forEach((cell, id) => {
+    if (!cell || cell.length < 3) return;
+    const { minX, minY, maxX, maxY } = polygonBounds(cell);
+    const left = Math.max(0, Math.floor(minX));
+    const top = Math.max(0, Math.floor(minY));
+    const right = Math.min(image.width, Math.ceil(maxX));
+    const bottom = Math.min(image.height, Math.ceil(maxY));
+    const width = right - left;
+    const height = bottom - top;
+    if (width < 1 || height < 1) return;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    ctx.beginPath();
+    cell.forEach(([x, y], index) => {
+      const localX = x - left;
+      const localY = y - top;
+      if (index === 0) ctx.moveTo(localX, localY);
+      else ctx.lineTo(localX, localY);
+    });
+    ctx.closePath();
+    ctx.clip();
+    ctx.drawImage(image, left, top, width, height, 0, 0, width, height);
+    if (!hasOpaquePixels(canvas, alphaThreshold)) return;
+
+    let finalCanvas = canvas;
+    let finalX = left;
+    let finalY = top;
+    const trimmed = trimCanvasToOpaqueBounds(finalCanvas, alphaThreshold);
+    if (trimmed.needsTrim) {
+      finalCanvas = trimmed.canvas;
+      finalX += trimmed.offset.x;
+      finalY += trimmed.offset.y;
+    }
+    if (recenterPivotToOpaque) {
+      const pivot = findOpaquePivotInCanvas(finalCanvas, alphaThreshold);
+      if (pivot.hasOpaque) {
+        const centered = recenterCanvasSoPointIsCenter(finalCanvas, pivot.x, pivot.y);
+        finalCanvas = centered.canvas;
+        finalX -= centered.offset.x;
+        finalY -= centered.offset.y;
+      }
+    }
+
+    pieces.push({
+      id: pieces.length,
+      canvas: finalCanvas,
+      originalX: finalX,
+      originalY: finalY,
+      width: finalCanvas.width,
+      height: finalCanvas.height,
+      cell,
+    });
+  });
+
+  return pieces;
+}
+
+export function generateGridCells(width, height, requestedPieces) {
+  const columns = Math.max(1, Math.round(Math.sqrt(requestedPieces * (width / height))));
+  const rows = Math.max(1, Math.ceil(requestedPieces / columns));
+  const cellWidth = width / columns;
+  const cellHeight = height / rows;
+  const cells = [];
+  for (let row = 0; row < rows; row++) {
+    for (let column = 0; column < columns; column++) {
+      const x0 = column * cellWidth;
+      const y0 = row * cellHeight;
+      const x1 = Math.min(width, (column + 1) * cellWidth);
+      const y1 = Math.min(height, (row + 1) * cellHeight);
+      cells.push([[x0, y0], [x1, y0], [x1, y1], [x0, y1]]);
+    }
+  }
+  return cells;
+}
+
+export function generateHexCells(width, height, requestedPieces) {
+  const radius = Math.max(4, Math.sqrt((width * height) / (Math.max(1, requestedPieces) * 2.598)));
+  const horizontalStep = Math.sqrt(3) * radius;
+  const verticalStep = 1.5 * radius;
+  const cells = [];
+  let row = 0;
+  for (let cy = -radius; cy <= height + radius; cy += verticalStep, row++) {
+    const offset = row % 2 ? horizontalStep / 2 : 0;
+    for (let cx = -horizontalStep + offset; cx <= width + horizontalStep; cx += horizontalStep) {
+      const cell = [];
+      for (let side = 0; side < 6; side++) {
+        const angle = (Math.PI / 180) * (60 * side - 30);
+        cell.push([cx + radius * Math.cos(angle), cy + radius * Math.sin(angle)]);
+      }
+      cells.push(cell);
+    }
+  }
+  return cells;
+}
+
+export function sliceImageIntoPolygonPieces(image, cells, options = {}) {
+  return slicePolygonCells(image, cells, options);
+}
+
+export function normalizeAlphaMask(image) {
+  const canvas = document.createElement('canvas');
+  canvas.width = image.width;
+  canvas.height = image.height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(image, 0, 0);
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  let opaque = 0;
+  let transparent = 0;
+  for (let index = 0; index < imageData.data.length; index += 4) {
+    const isOpaque = imageData.data[index + 3] === 255;
+    imageData.data[index] = 255;
+    imageData.data[index + 1] = 255;
+    imageData.data[index + 2] = 255;
+    imageData.data[index + 3] = isOpaque ? 255 : 0;
+    if (isOpaque) opaque++;
+    else transparent++;
+  }
+  ctx.putImageData(imageData, 0, 0);
+  return { canvas, opaque, transparent };
+}
+
+export function sliceImageWithMask(image, maskCanvas, requestedPieces, options = {}) {
+  const { alphaThreshold = 8, recenterPivotToOpaque = true } = options;
+  const columns = Math.max(1, Math.round(Math.sqrt(requestedPieces * (image.width / image.height))));
+  const rows = Math.max(1, Math.ceil(requestedPieces / columns));
+  const tileWidth = image.width / columns;
+  const tileHeight = image.height / rows;
+  const pieces = [];
+
+  for (let row = 0; row < rows; row++) {
+    for (let column = 0; column < columns; column++) {
+      const left = Math.floor(column * tileWidth);
+      const top = Math.floor(row * tileHeight);
+      const right = Math.min(image.width, Math.ceil((column + 1) * tileWidth));
+      const bottom = Math.min(image.height, Math.ceil((row + 1) * tileHeight));
+      const width = right - left;
+      const height = bottom - top;
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(image, left, top, width, height, 0, 0, width, height);
+      ctx.globalCompositeOperation = 'destination-in';
+      ctx.imageSmoothingEnabled = false;
+      const scale = Math.min(width / maskCanvas.width, height / maskCanvas.height);
+      const maskWidth = maskCanvas.width * scale;
+      const maskHeight = maskCanvas.height * scale;
+      const maskX = (width - maskWidth) / 2;
+      const maskY = (height - maskHeight) / 2;
+      ctx.drawImage(maskCanvas, maskX, maskY, maskWidth, maskHeight);
+      ctx.globalCompositeOperation = 'source-over';
+      if (!hasOpaquePixels(canvas, alphaThreshold)) continue;
+
+      let finalCanvas = canvas;
+      let finalX = left;
+      let finalY = top;
+      const trimmed = trimCanvasToOpaqueBounds(finalCanvas, alphaThreshold);
+      if (trimmed.needsTrim) {
+        finalCanvas = trimmed.canvas;
+        finalX += trimmed.offset.x;
+        finalY += trimmed.offset.y;
+      }
+      if (recenterPivotToOpaque) {
+        const pivot = findOpaquePivotInCanvas(finalCanvas, alphaThreshold);
+        if (pivot.hasOpaque) {
+          const centered = recenterCanvasSoPointIsCenter(finalCanvas, pivot.x, pivot.y);
+          finalCanvas = centered.canvas;
+          finalX -= centered.offset.x;
+          finalY -= centered.offset.y;
+        }
+      }
+
+      pieces.push({
+        id: pieces.length,
+        canvas: finalCanvas,
+        originalX: finalX,
+        originalY: finalY,
+        width: finalCanvas.width,
+        height: finalCanvas.height,
+        cell: [[left, top], [right, top], [right, bottom], [left, bottom]],
+      });
+    }
+  }
+  return pieces;
+}
+
 export function canvasToBlob(canvas, type = 'image/png', quality) {
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => {
